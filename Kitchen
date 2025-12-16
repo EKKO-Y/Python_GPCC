@@ -1,0 +1,682 @@
+"""
+DEPO (Determinantal Expert Policy Optimization) - 修复版本
+
+修复内容：
+1. [严重] Jacobian 修正：正确实现 Squashed Gaussian 混合似然
+2. [中等] DPP 距离计算：在 Pre-tanh 空间计算专家距离，避免边界失真
+3. [Bug] 补充缺失的 reward_bias/reward_scale 参数
+4. [Bug] dpp_kernel_scale 初始化问题
+5. [优化] 添加详细注释说明修复原因
+"""
+
+import os
+import random
+import uuid
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import gym
+import d4rl
+
+
+# ==============================================================================
+# 1. 配置与超参数 (Config)
+# ==============================================================================
+class Config:
+    # --- 环境与基础设置 ---
+    env_name = "kitchen-mixed-v0"
+    seed = 42
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- 架构参数 ---
+    hidden_dim = 512
+    num_experts = 8  # 专家数量 K
+    n_hidden = 2  # MLP深度
+    dropout = 0  # [SOTA] Actor 防止过拟合
+    use_layer_norm = True  # [SOTA] Actor 使用 LN 稳定梯度
+
+    # --- 训练参数 ---
+    batch_size = 1024
+    max_steps = 500_000  # 总训练步数
+    eval_freq = 20_000  # 评估频率
+    eval_episodes = 100  # 评估回合数
+
+    # 学习率
+    lr = 3e-4  # Actor LR (Starting)
+    lr_end = 5e-6  # Actor LR (Ending)
+    weight_decay = 2e-4  # [New] Actor Weight Decay (AdamW)
+    vf_lr = 3e-4  # V-Function LR
+    qf_lr = 3e-4  # Q-Function LR
+
+    # [关键防御] 梯度裁剪阈值
+    max_grad_norm = 5.0
+
+    # --- IQL 核心参数 ---
+    discount = 0.99
+    tau = 0.8  # Expectile 0.8
+    beta = 3.0  # AWR temperature
+    iql_tau = 0.005  # Target net soft update rate
+
+    # --- DEPO 核心参数 ---
+    # Gumbel Annealing
+    temp_start = 1.0
+    temp_end = 0.1
+
+    # DPP 多样性
+    lambda_dpp = 0.1
+    dpp_epsilon = 1e-6  # Identity Shielding
+    dpp_margin_beta = 5.0  # Q-Masking 敏感度
+
+    # [修复] DPP Kernel Scale - 设置默认值，会在 main() 中根据动作维度动态调整
+    dpp_kernel_scale = 1.0
+    
+    # [修复] Pre-tanh 空间的 kernel scale 需要更大
+    # 因为 pre-tanh 空间范围是 (-inf, +inf)，而 post-tanh 是 [-1, 1]
+    dpp_kernel_scale_pretanh_multiplier = 4.0
+
+    # [优化] Pre-Tanh Regularization
+    lambda_tanh_reg = 1e-2
+    tanh_reg_threshold = 10.0
+
+    # 负载均衡
+    lambda_load = 0.01
+    load_ema_alpha = 0.05
+
+    # --- [修复] 奖励缩放参数 (AntMaze Hack) ---
+    reward_bias = -1.0  # AntMaze: 将 0/1 奖励变为 -1/0
+    reward_scale = 5.0  # 放大奖励信号
+
+
+args = Config()
+
+
+# ==============================================================================
+# 2. 基础组件 (Utils & Networks)
+# ==============================================================================
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def compute_mean_std(states: np.ndarray, eps: float) -> tuple:
+    mean = states.mean(0)
+    std = states.std(0) + eps
+    return mean, std
+
+
+def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
+    return (states - mean) / std
+
+
+def orthogonal_init(layer, gain=np.sqrt(2)):
+    if isinstance(layer, nn.Linear):
+        nn.init.orthogonal_(layer.weight, gain=gain)
+        if layer.bias is not None:
+            nn.init.constant_(layer.bias, 0.0)
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim, n_layers, dropout=0.0, layer_norm=False):
+        super().__init__()
+        layers = []
+        in_dim = input_dim
+        for _ in range(n_layers):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            if layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, output_dim))
+
+        self.net = nn.Sequential(*layers)
+        self.apply(lambda m: orthogonal_init(m))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ==============================================================================
+# 3. DEPO 策略网络 (Policy Network)
+# ==============================================================================
+class DepoPolicy(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim, num_experts):
+        super().__init__()
+        self.num_experts = num_experts
+        self.action_dim = action_dim
+
+        # 1. Backbone (Actor 使用 LN 和 Dropout)
+        self.backbone = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim) if args.use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+            nn.Dropout(args.dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim) if args.use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+            nn.Dropout(args.dropout)
+        )
+        self.backbone.apply(orthogonal_init)
+
+        # 2. Router
+        self.router = nn.Linear(hidden_dim, num_experts)
+        orthogonal_init(self.router, gain=0.01)
+
+        # 3. Experts
+        # [重要] experts_mean 输出的是 PRE-TANH 均值
+        # 最终动作 = tanh(pre_tanh_mean + noise)
+        self.experts_mean = nn.ModuleList([nn.Linear(hidden_dim, action_dim) for _ in range(num_experts)])
+        self.experts_logstd = nn.ModuleList([nn.Linear(hidden_dim, action_dim) for _ in range(num_experts)])
+
+        for exp in self.experts_mean:
+            orthogonal_init(exp, gain=0.01)
+        for exp in self.experts_logstd:
+            orthogonal_init(exp, gain=0.01)
+
+        # [修复] 标准差范围 - 这是在 PRE-TANH 空间的标准差
+        self.log_std_min = -5.0  # 更小的下界允许更精确的动作
+        self.log_std_max = 2.0   # 更大的上界允许更多探索
+
+    def forward(self, state, temperature=1.0, hard=False, eval_mode=False):
+        features = self.backbone(state)
+
+        # --- A. 路由 ---
+        router_logits = self.router(features)
+
+        if eval_mode:
+            gate_indices = torch.argmax(router_logits, dim=-1)
+            gate_mask = F.one_hot(gate_indices, num_classes=self.num_experts).float()
+            gate_probs = F.softmax(router_logits, dim=-1)
+        else:
+            gate_mask = F.gumbel_softmax(router_logits, tau=temperature, hard=hard)
+            gate_probs = F.softmax(router_logits, dim=-1)
+
+        # --- B. 专家输出 ---
+        # [关键] raw_means 是 PRE-TANH 空间的均值
+        raw_means = torch.stack([exp(features) for exp in self.experts_mean], dim=1)  # [B, K, A]
+        
+        # [关键] post_tanh_means 是用于执行的动作（范围 [-1, 1]）
+        post_tanh_means = torch.tanh(raw_means)  # [B, K, A]
+
+        # [关键] log_stds 是 PRE-TANH 空间的标准差
+        log_stds = torch.stack([exp(features) for exp in self.experts_logstd], dim=1)
+        log_stds = torch.clamp(log_stds, self.log_std_min, self.log_std_max)
+        stds = torch.exp(log_stds)  # PRE-TANH 空间的标准差
+
+        # --- C. 聚合 (用于执行) ---
+        # 注意：执行时使用 post_tanh_means
+        final_mean = torch.einsum('bk,bka->ba', gate_mask, post_tanh_means)
+        final_std = torch.einsum('bk,bka->ba', gate_mask, stds)
+
+        # 返回：final_mean (执行用), final_std, gate_probs, 
+        #       post_tanh_means (Q评估用), stds, raw_means (似然计算用)
+        return final_mean, final_std, gate_probs, post_tanh_means, stds, raw_means
+
+    def get_action(self, state):
+        """推理时获取动作"""
+        with torch.no_grad():
+            state = torch.FloatTensor(state).to(args.device).unsqueeze(0)
+            mean, _, _, _, _, _ = self(state, eval_mode=True)
+            action = mean.cpu().numpy()[0]
+        return np.clip(action, -1.0, 1.0)
+
+
+# ==============================================================================
+# 4. 价值网络 (Critic Networks)
+# ==============================================================================
+class ValueFunction(nn.Module):
+    def __init__(self, state_dim, hidden_dim):
+        super().__init__()
+        self.net = MLP(state_dim, 1, hidden_dim, 2, layer_norm=True)
+
+    def forward(self, state):
+        return self.net(state)
+
+
+class TwinQ(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim):
+        super().__init__()
+        self.q1 = MLP(state_dim + action_dim, 1, hidden_dim, 2, layer_norm=True)
+        self.q2 = MLP(state_dim + action_dim, 1, hidden_dim, 2, layer_norm=True)
+
+    def forward(self, state, action):
+        sa = torch.cat([state, action], dim=1)
+        return self.q1(sa), self.q2(sa)
+
+
+# ==============================================================================
+# 5. [核心修复] Squashed Gaussian 混合似然计算
+# ==============================================================================
+def compute_squashed_mixture_log_prob(actions, raw_means, stds, gate_probs):
+    """
+    [修复1] 正确的 Squashed Gaussian 混合似然
+    
+    数学推导：
+    设 u ~ N(μ, σ²)，a = tanh(u)
+    则 p(a) = p(u) * |du/da| = N(u; μ, σ²) * 1/(1 - a²)
+    
+    对数形式：
+    log p(a) = log N(u; μ, σ²) - log(1 - a²)
+    其中 u = atanh(a)
+    
+    Args:
+        actions: [B, A] 数据集中的动作，范围 [-1, 1]
+        raw_means: [B, K, A] 各专家的 PRE-TANH 均值
+        stds: [B, K, A] 各专家的 PRE-TANH 标准差
+        gate_probs: [B, K] 门控概率
+    
+    Returns:
+        mixture_log_prob: [B, 1] 混合分布的对数似然
+    """
+    B, K, A = raw_means.shape
+    
+    # Step 1: 将动作从 tanh 空间反变换到 pre-tanh 空间
+    # atanh(x) = 0.5 * log((1+x)/(1-x))
+    # 需要 clamp 避免数值问题 (atanh(±1) = ±∞)
+    EPS = 1e-6
+    actions_clamped = torch.clamp(actions, -1.0 + EPS, 1.0 - EPS)  # [B, A]
+    
+    # u = atanh(a)，这是 pre-tanh 空间的值
+    u = torch.atanh(actions_clamped)  # [B, A]
+    u_expanded = u.unsqueeze(1).expand(B, K, A)  # [B, K, A]
+    
+    # Step 2: 在 PRE-TANH 空间计算高斯对数概率
+    # log N(u; μ, σ) = -0.5 * ((u - μ)² / σ² + log(2πσ²))
+    var = stds.pow(2)  # [B, K, A]
+    log_prob_u = -0.5 * (
+        (u_expanded - raw_means).pow(2) / var +
+        torch.log(var) +
+        np.log(2 * np.pi)
+    )
+    log_prob_u = log_prob_u.sum(dim=-1)  # [B, K] 对动作维度求和
+    
+    # Step 3: Jacobian 修正
+    # |du/da| = 1 / (1 - a²)
+    # log|du/da| = -log(1 - a²)
+    # 对所有动作维度求和
+    log_jacobian = -torch.log(1.0 - actions_clamped.pow(2) + EPS).sum(dim=-1)  # [B]
+    log_jacobian = log_jacobian.unsqueeze(1)  # [B, 1] 便于广播
+    
+    # Step 4: 计算混合似然
+    # log p(a) = log Σ_k [w_k * p_k(a)]
+    #          = log Σ_k [exp(log w_k + log p_k(a))]
+    #          = logsumexp_k(log w_k + log p_k(u) + log|du/da|)
+    log_gate = torch.log(gate_probs + EPS)  # [B, K]
+    
+    # 每个专家的完整对数概率 = pre-tanh 高斯 + Jacobian
+    log_component_prob = log_prob_u + log_jacobian  # [B, K]
+    
+    # 加权混合
+    weighted_log_probs = log_gate + log_component_prob  # [B, K]
+    
+    # LogSumExp 计算混合似然
+    mixture_log_prob = torch.logsumexp(weighted_log_probs, dim=1, keepdim=True)  # [B, 1]
+    
+    return mixture_log_prob
+
+
+# ==============================================================================
+# 6. [核心修复] Pre-tanh 空间 DPP 距离计算
+# ==============================================================================
+def compute_dpp_loss_pretanh(raw_means, expert_weights, kernel_scale, epsilon):
+    """
+    [修复2] 在 Pre-tanh 空间计算 DPP 损失
+    
+    问题分析：
+    tanh 是非线性压缩函数，在边界区域（|x| > 2）梯度几乎为零。
+    如果在 post-tanh 空间计算距离：
+    - pre-tanh: |8 - 10| = 2 (相距较远)
+    - post-tanh: |tanh(8) - tanh(10)| ≈ |0.9999 - 0.99999| ≈ 0.00001 (几乎重叠)
+    
+    这会导致边界区域的专家被错误地认为"足够分散"，DPP 不施加排斥力。
+    
+    解决方案：
+    直接在 pre-tanh 空间计算专家之间的距离，保持正确的几何关系。
+    
+    Args:
+        raw_means: [B, K, A] 各专家的 PRE-TANH 均值
+        expert_weights: [B, K] Q-Masking 权重 (sigmoid(β * A))
+        kernel_scale: float, RBF 核的尺度参数
+        epsilon: float, Identity Shielding 的小常数
+    
+    Returns:
+        dpp_loss: scalar, -log det(L_robust) 的均值
+    """
+    B, K, A = raw_means.shape
+    
+    # Step 1: 在 PRE-TANH 空间计算专家之间的距离
+    # diff[b, i, j, a] = raw_means[b, i, a] - raw_means[b, j, a]
+    diff = raw_means.unsqueeze(2) - raw_means.unsqueeze(1)  # [B, K, K, A]
+    dist_sq = torch.sum(diff.pow(2), dim=-1)  # [B, K, K]
+    
+    # Step 2: RBF 核矩阵
+    # K(μ_i, μ_j) = exp(-||μ_i - μ_j||² / (2 * scale²))
+    # 注意：pre-tanh 空间范围更大，需要调整 scale
+    adjusted_scale = kernel_scale * args.dpp_kernel_scale_pretanh_multiplier
+    kernel_mat = torch.exp(-dist_sq / (2 * adjusted_scale ** 2))  # [B, K, K]
+    
+    # Step 3: Q-Masking 加权
+    # L̃_ij = m_i * m_j * K(μ_i, μ_j)
+    weight_matrix = expert_weights.unsqueeze(2) * expert_weights.unsqueeze(1)  # [B, K, K]
+    weighted_kernel = kernel_mat * weight_matrix  # [B, K, K]
+    
+    # Step 4: Identity Shielding
+    # L_robust = L̃ + diag(1 - m²) + εI
+    # 当 m_k → 0 时，对角元 → 1+ε，非对角元 → 0，专家 k 自动解耦
+    m_sq = expert_weights.pow(2)  # [B, K]
+    padding_diag = 1.0 - m_sq + epsilon  # [B, K]
+    padding_mat = torch.diag_embed(padding_diag)  # [B, K, K]
+    
+    L_robust = weighted_kernel + padding_mat  # [B, K, K]
+    
+    # Step 5: 计算 log det(L_robust)
+    # 使用 Cholesky 分解提高数值稳定性
+    # log det(L) = 2 * Σ log(diag(chol(L)))
+    try:
+        L_chol = torch.linalg.cholesky(L_robust)
+        log_det = 2.0 * torch.sum(
+            torch.log(torch.diagonal(L_chol, dim1=-2, dim2=-1) + 1e-10),
+            dim=-1
+        )  # [B]
+        dpp_loss = -log_det.mean()
+    except RuntimeError as e:
+        # Cholesky 分解失败（矩阵不正定），返回 0 损失
+        print(f"Warning: Cholesky decomposition failed: {e}")
+        dpp_loss = torch.tensor(0.0, device=raw_means.device)
+    
+    return dpp_loss
+
+
+# ==============================================================================
+# 7. DEPO Agent
+# ==============================================================================
+class DEPOAgent:
+    def __init__(self, state_dim, action_dim):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        
+        self.policy = DepoPolicy(state_dim, action_dim, args.hidden_dim, args.num_experts).to(args.device)
+        self.q_net = TwinQ(state_dim, action_dim, args.hidden_dim).to(args.device)
+        self.q_target = TwinQ(state_dim, action_dim, args.hidden_dim).to(args.device)
+        self.q_target.load_state_dict(self.q_net.state_dict())
+        self.v_net = ValueFunction(state_dim, args.hidden_dim).to(args.device)
+
+        # [关键] Actor 使用 AdamW，Critic 使用 Adam
+        self.policy_optimizer = optim.AdamW(self.policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        self.q_optimizer = optim.Adam(self.q_net.parameters(), lr=args.qf_lr)
+        self.v_optimizer = optim.Adam(self.v_net.parameters(), lr=args.vf_lr)
+
+        self.policy_lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.policy_optimizer, T_max=args.max_steps, eta_min=args.lr_end
+        )
+
+        self.ema_quality_dist = torch.ones(args.num_experts).to(args.device) / args.num_experts
+
+    def get_current_temperature(self, step):
+        """Gumbel-Softmax 温度退火"""
+        p = min(1.0, step / args.max_steps)
+        return args.temp_start + p * (args.temp_end - args.temp_start)
+
+    def update_v(self, states, actions):
+        """更新 V 网络 (Expectile Regression)"""
+        with torch.no_grad():
+            q1, q2 = self.q_target(states, actions)
+            q_target = torch.min(q1, q2)
+
+        v_pred = self.v_net(states)
+        diff = q_target - v_pred
+        weight = torch.where(diff > 0, args.tau, 1 - args.tau)
+        v_loss = torch.mean(weight * (diff ** 2))
+
+        self.v_optimizer.zero_grad()
+        v_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.v_net.parameters(), args.max_grad_norm)
+        self.v_optimizer.step()
+        return v_loss.item()
+
+    def update_q(self, states, actions, rewards, next_states, terminals):
+        """更新 Q 网络"""
+        with torch.no_grad():
+            next_v = self.v_net(next_states)
+            q_target = rewards + args.discount * (1. - terminals) * next_v
+
+        q1, q2 = self.q_net(states, actions)
+        q_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+
+        self.q_optimizer.zero_grad()
+        q_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), args.max_grad_norm)
+        self.q_optimizer.step()
+
+        # Soft update target network
+        for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
+            target_param.data.copy_(args.iql_tau * param.data + (1 - args.iql_tau) * target_param.data)
+
+        return q_loss.item()
+
+    def update_policy(self, states, actions, step):
+        """
+        更新策略网络
+        
+        包含以下损失：
+        1. policy_loss: AWR 加权的混合似然
+        2. dpp_loss: Q-Masked DPP 多样性损失
+        3. load_loss: 负载均衡损失
+        4. reg_loss: Pre-tanh 正则化
+        """
+        # ==================== 1. 计算 Advantage ====================
+        with torch.no_grad():
+            q1, q2 = self.q_target(states, actions)
+            q_val = torch.min(q1, q2)
+            v_val = self.v_net(states)
+            adv = q_val - v_val
+            
+            # AWR 权重
+            exp_adv = torch.exp(adv * args.beta)
+            exp_adv = torch.clamp(exp_adv, max=100.0)
+
+        # ==================== 2. 策略前向传播 ====================
+        current_temp = self.get_current_temperature(step)
+        final_mean, final_std, gate_probs, post_tanh_means, stds, raw_means = self.policy(
+            states, temperature=current_temp, hard=False
+        )
+        # final_mean: [B, A] 执行用
+        # post_tanh_means: [B, K, A] Q评估用
+        # raw_means: [B, K, A] 似然计算用
+        # stds: [B, K, A] pre-tanh 标准差
+
+        # ==================== 3. [修复1] 混合似然损失 ====================
+        # 使用正确的 Squashed Gaussian 似然计算
+        mixture_log_prob = compute_squashed_mixture_log_prob(
+            actions=actions,           # [B, A] 数据集动作
+            raw_means=raw_means,       # [B, K, A] pre-tanh 均值
+            stds=stds,                 # [B, K, A] pre-tanh 标准差
+            gate_probs=gate_probs      # [B, K] 门控概率
+        )
+        
+        policy_loss = -(exp_adv * mixture_log_prob).mean()
+
+        # ==================== 4. Q-Masked DPP 损失 ====================
+        B, K, A_dim = raw_means.shape
+        
+        # 4.1 计算专家动作的 Q 值（使用 post-tanh 均值）
+        states_expanded = states.unsqueeze(1).expand(B, K, self.state_dim).reshape(B * K, self.state_dim)
+        expert_actions_flat = post_tanh_means.detach().reshape(B * K, A_dim)
+        
+        with torch.no_grad():
+            q_e1, q_e2 = self.q_target(states_expanded, expert_actions_flat)
+            q_expert_vals = torch.min(q_e1, q_e2).reshape(B, K)
+            expert_adv = q_expert_vals - v_val  # [B, K]
+            
+            # Q-Masking: sigmoid(β * A)
+            expert_weights = torch.sigmoid(expert_adv * args.dpp_margin_beta)  # [B, K]
+
+        # 4.2 [修复2] 在 Pre-tanh 空间计算 DPP 损失
+        dpp_loss = compute_dpp_loss_pretanh(
+            raw_means=raw_means,              # [B, K, A] pre-tanh 均值
+            expert_weights=expert_weights,    # [B, K] Q-masking 权重
+            kernel_scale=args.dpp_kernel_scale,
+            epsilon=args.dpp_epsilon
+        )
+
+        # ==================== 5. Pre-Tanh 正则化 ====================
+        # 防止 raw_means 过大导致 tanh 饱和
+        raw_means_abs = raw_means.abs()
+        excess = F.relu(raw_means_abs - args.tanh_reg_threshold)
+        reg_loss = args.lambda_tanh_reg * (excess ** 2).mean()
+
+        # ==================== 6. 负载均衡损失 ====================
+        avg_router_usage = gate_probs.mean(dim=0)  # [K]
+        
+        with torch.no_grad():
+            avg_expert_quality = expert_weights.mean(dim=0)  # [K]
+            # Laplace 平滑
+            alpha_smooth = 1e-2
+            numerator = avg_expert_quality + alpha_smooth
+            denominator = avg_expert_quality.sum() + args.num_experts * alpha_smooth
+            current_target_usage = numerator / denominator
+
+            # EMA 更新目标分布
+            self.ema_quality_dist = (1 - args.load_ema_alpha) * self.ema_quality_dist + \
+                                    args.load_ema_alpha * current_target_usage
+
+        load_loss = F.mse_loss(avg_router_usage, self.ema_quality_dist)
+
+        # ==================== 7. 总损失 ====================
+        total_loss = (
+            policy_loss + 
+            args.lambda_dpp * dpp_loss + 
+            args.lambda_load * load_loss + 
+            reg_loss
+        )
+
+        # ==================== 8. 反向传播 ====================
+        self.policy_optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), args.max_grad_norm)
+        self.policy_optimizer.step()
+        self.policy_lr_scheduler.step()
+
+        return policy_loss.item(), dpp_loss.item(), load_loss.item(), reg_loss.item(), current_temp
+
+
+# ==============================================================================
+# 8. 数据处理与主循环
+# ==============================================================================
+def get_dataset(env):
+    """加载并预处理数据集"""
+    dataset = d4rl.qlearning_dataset(env)
+
+    # [修复] Reward Scaling (AntMaze Hack)
+    if "antmaze" in args.env_name:
+        print(f"Applying AntMaze Reward Scaling: (r + {args.reward_bias}) * {args.reward_scale}")
+        dataset['rewards'] = (dataset['rewards'] + args.reward_bias) * args.reward_scale
+    elif "kitchen" in args.env_name:
+        print("Kitchen environment - using original rewards")
+        # Kitchen 环境通常不需要额外缩放
+
+    return dataset
+
+
+def eval_policy(agent, env_name, seed, state_mean, state_std, eval_episodes=100):
+    """评估策略性能"""
+    eval_env = gym.make(env_name)
+    eval_env.seed(seed + 100)
+
+    total_normalized_score = 0.
+
+    for _ in range(eval_episodes):
+        state, done = eval_env.reset(), False
+        episode_reward = 0
+        while not done:
+            # 归一化状态
+            state_norm = (state - state_mean) / state_std
+            action = agent.policy.get_action(state_norm)
+            state, reward, done, _ = eval_env.step(action)
+            episode_reward += reward
+
+        total_normalized_score += eval_env.get_normalized_score(episode_reward)
+
+    avg_score = (total_normalized_score / eval_episodes) * 100
+    return avg_score
+
+
+def main():
+    set_seed(args.seed)
+
+    env = gym.make(args.env_name)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+
+    # [修复] 动态计算 Kernel Scale
+    # 经验公式: Scale ≈ sqrt(Dim) / 1.5
+    args.dpp_kernel_scale = np.sqrt(action_dim) / 1.5
+    
+    print("=" * 60)
+    print(f"DEPO-Fixed Training on {args.env_name}")
+    print("=" * 60)
+    print(f"State dim: {state_dim}, Action dim: {action_dim}")
+    print(f"Num experts: {args.num_experts}")
+    print(f"DPP kernel scale: {args.dpp_kernel_scale:.4f}")
+    print(f"DPP kernel scale (pre-tanh adjusted): {args.dpp_kernel_scale * args.dpp_kernel_scale_pretanh_multiplier:.4f}")
+    print("=" * 60)
+    print("Fixes applied:")
+    print("  1. [Critical] Jacobian correction in Squashed Gaussian likelihood")
+    print("  2. [Important] DPP distance computed in pre-tanh space")
+    print("  3. [Bug] reward_bias/reward_scale parameters added")
+    print("=" * 60)
+
+    # 数据处理
+    data_dict = get_dataset(env)
+
+    # 状态归一化
+    state_mean, state_std = compute_mean_std(data_dict['observations'], eps=1e-3)
+
+    data_dict['observations'] = normalize_states(data_dict['observations'], state_mean, state_std)
+    data_dict['next_observations'] = normalize_states(data_dict['next_observations'], state_mean, state_std)
+
+    dataset = dict(
+        states=torch.from_numpy(data_dict['observations']).float(),
+        actions=torch.from_numpy(data_dict['actions']).float(),
+        rewards=torch.from_numpy(data_dict['rewards']).float().unsqueeze(-1),
+        next_states=torch.from_numpy(data_dict['next_observations']).float(),
+        terminals=torch.from_numpy(data_dict['terminals']).float().unsqueeze(-1)
+    )
+
+    N = dataset['states'].shape[0]
+    print(f"Dataset size: {N}")
+    
+    agent = DEPOAgent(state_dim, action_dim)
+
+    # 训练循环
+    for step in range(args.max_steps):
+        idx = np.random.randint(0, N, args.batch_size)
+        states = dataset['states'][idx].to(args.device)
+        actions = dataset['actions'][idx].to(args.device)
+        rewards = dataset['rewards'][idx].to(args.device)
+        next_states = dataset['next_states'][idx].to(args.device)
+        terminals = dataset['terminals'][idx].to(args.device)
+
+        v_loss = agent.update_v(states, actions)
+        q_loss = agent.update_q(states, actions, rewards, next_states, terminals)
+        pi_loss, dpp_loss, load_loss, reg_loss, temp = agent.update_policy(states, actions, step)
+
+        if (step + 1) % 5000 == 0:
+            current_lr = agent.policy_optimizer.param_groups[0]['lr']
+            print(f"Step {step + 1}: V={v_loss:.4f}, Q={q_loss:.4f}, Pi={pi_loss:.4f}, "
+                  f"DPP={dpp_loss:.4f}, Reg={reg_loss:.6f}, Temp={temp:.2f}, LR={current_lr:.6f}")
+
+        if (step + 1) % args.eval_freq == 0:
+            score = eval_policy(agent, args.env_name, args.seed, state_mean, state_std, args.eval_episodes)
+            print(f">>> Evaluation at step {step + 1}: Score = {score:.2f}")
+
+
+if __name__ == "__main__":
+    main()
