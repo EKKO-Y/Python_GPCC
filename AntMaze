@@ -1,0 +1,843 @@
+"""
+DEPO (Determinantal Expert Policy Optimization) - AntMaze 优化版本
+
+
+AntMaze 特性：
+1. 极度稀疏奖励 (只有到达目标才有 reward=1)
+2. 需要从次优轨迹中 "stitching" 出最优路径
+3. 轨迹很长，需要长期规划
+4. 多模态策略（多条可行路径）
+
+
+针对性优化：
+1. 奖励缩放：标准 IQL 方式 (r - 1)
+2. 更高的 discount 适应长轨迹
+3. 更高的 expectile τ 处理稀疏奖励
+4. 调整 beta 匹配奖励尺度
+"""
+
+import contextlib
+import os
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import gym
+import d4rl
+
+
+
+
+# ==============================================================================
+# 1. AntMaze 专用配置
+# ==============================================================================
+class AntMazeConfig:
+   """
+   AntMaze 环境的优化配置
+
+
+   关键调整说明：
+   - reward: r - 1 (标准 IQL 方式，不额外缩放)
+   - beta: 10.0 (匹配 advantage 范围 [-1, 0])
+   - tau: 0.9 (更高的 expectile 处理稀疏奖励)
+   - discount: 0.99 (长轨迹需要高折扣)
+   """
+
+
+   # --- 环境设置 ---
+   # 可选: antmaze-umaze-v2, antmaze-medium-diverse-v2, antmaze-large-diverse-v2
+   env_name = "antmaze-medium-diverse-v2"
+   seed = 42
+   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+   # --- 架构参数 ---
+   hidden_dim = 256  # AntMaze 状态空间较小，不需要太大网络
+   num_experts = 4  # 4个专家足以覆盖主要路径模式
+   dropout = 0.0
+   use_layer_norm = True
+
+
+   # --- 训练参数 ---
+   batch_size = 256  # AntMaze 数据集较小，用小 batch
+   max_steps = 1_000_000  # AntMaze 需要更长训练
+   eval_freq = 50_000
+   eval_episodes = 100  # AntMaze 方差大，需要更多评估
+
+
+   # 学习率
+   lr = 3e-4
+   lr_end = 3e-5
+   weight_decay = 1e-4
+   vf_lr = 3e-4
+   qf_lr = 3e-4
+
+
+   max_grad_norm = 1.0  # AntMaze 需要更严格的梯度裁剪
+
+
+   # --- IQL 核心参数 (AntMaze 专用) ---
+   discount = 0.99  # 标准值，0.995 也可以尝试
+
+
+   # [关键] Expectile τ
+   # 稀疏奖励需要更高的 τ 来更好估计最优价值
+   # umaze: 0.7, medium: 0.8-0.9, large: 0.9
+   tau = 0.9
+
+
+   # [关键] AWR Temperature (Beta)
+   # AntMaze 奖励经过 r-1 变换后范围是 [-1, 0]
+   # advantage 范围大约也是 [-1, 0]
+   # beta=10 使得 exp(beta * adv) 在 [exp(-10), 1] ≈ [0, 1] 范围
+   beta = 10.0
+
+
+   iql_tau = 0.005  # Target net soft update
+
+
+   # --- DEPO 参数 ---
+   temp_start = 1.0
+   temp_end = 0.1
+
+
+   # DPP 多样性 (AntMaze 需要更强的多样性保持)
+   lambda_dpp = 0.1
+   dpp_epsilon = 1e-6
+   dpp_margin_beta = 5.0
+   dpp_kernel_scale = 1.0  # 会在 main() 中动态设置
+   dpp_kernel_scale_pretanh_multiplier = 4.0
+
+
+   # Pre-Tanh 正则化
+   lambda_tanh_reg = 1e-3  # AntMaze 动作范围重要，稍微放松
+   tanh_reg_threshold = 8.0
+
+
+   # 负载均衡
+   lambda_load = 0.1
+   load_ema_alpha = 0.05
+
+
+   # --- [关键] AntMaze 奖励处理 ---
+   # 标准 IQL 方式：r - 1，将 0/1 变为 -1/0
+   # 不做额外缩放，保持 advantage 在合理范围
+   reward_bias = -1.0
+   reward_scale = 1.0  # 不缩放！这是与 Kitchen 的关键区别
+
+
+
+
+# 根据具体环境微调
+class AntMazeUmazeConfig(AntMazeConfig):
+   """umaze 较简单"""
+   env_name = "antmaze-umaze-v2"
+   tau = 0.7
+   beta = 3.0
+   num_experts = 4
+   max_steps = 500_000
+
+
+
+
+class AntMazeMediumConfig(AntMazeConfig):
+   """medium 难度适中"""
+   env_name = "antmaze-medium-diverse-v2"
+   tau = 0.9
+   beta = 10.0
+   num_experts = 4
+   max_steps = 1_000_000
+
+
+
+
+class AntMazeLargeConfig(AntMazeConfig):
+   """large 最难，需要复杂 stitching"""
+   env_name = "antmaze-large-diverse-v2"
+   tau = 0.9
+   beta = 10.0
+   num_experts = 8  # 更多专家覆盖复杂路径
+   hidden_dim = 512
+   max_steps = 1_000_000
+   lambda_dpp = 0.15  # 更强的多样性
+
+
+
+
+# 选择配置
+args = AntMazeMediumConfig()
+
+
+
+
+# ==============================================================================
+# 2. 基础组件
+# ==============================================================================
+
+
+def set_seed(seed):
+   random.seed(seed)
+   np.random.seed(seed)
+   torch.manual_seed(seed)
+   if torch.cuda.is_available():
+       torch.cuda.manual_seed_all(seed)
+
+
+
+
+def compute_mean_std(states: np.ndarray, eps: float) -> tuple:
+   mean = states.mean(0)
+   std = states.std(0) + eps
+   return mean, std
+
+
+
+
+def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
+   return (states - mean) / std
+
+
+
+
+def orthogonal_init(layer, gain=np.sqrt(2)):
+   if isinstance(layer, nn.Linear):
+       nn.init.orthogonal_(layer.weight, gain=gain)
+       if layer.bias is not None:
+           nn.init.constant_(layer.bias, 0.0)
+
+
+
+
+class MLP(nn.Module):
+   def __init__(self, input_dim, output_dim, hidden_dim, n_layers, dropout=0.0, layer_norm=False):
+       super().__init__()
+       layers = []
+       in_dim = input_dim
+       for _ in range(n_layers):
+           layers.append(nn.Linear(in_dim, hidden_dim))
+           if layer_norm:
+               layers.append(nn.LayerNorm(hidden_dim))
+           layers.append(nn.ReLU())
+           if dropout > 0:
+               layers.append(nn.Dropout(dropout))
+           in_dim = hidden_dim
+       layers.append(nn.Linear(in_dim, output_dim))
+       self.net = nn.Sequential(*layers)
+       self.apply(lambda m: orthogonal_init(m))
+
+
+   def forward(self, x):
+       return self.net(x)
+
+
+
+
+# ==============================================================================
+# 3. DEPO 策略网络
+# ==============================================================================
+class DepoPolicy(nn.Module):
+   def __init__(self, state_dim, action_dim, hidden_dim, num_experts):
+       super().__init__()
+       self.num_experts = num_experts
+       self.action_dim = action_dim
+
+
+       self.backbone = nn.Sequential(
+           nn.Linear(state_dim, hidden_dim),
+           nn.LayerNorm(hidden_dim) if args.use_layer_norm else nn.Identity(),
+           nn.ReLU(),
+           nn.Dropout(args.dropout),
+           nn.Linear(hidden_dim, hidden_dim),
+           nn.LayerNorm(hidden_dim) if args.use_layer_norm else nn.Identity(),
+           nn.ReLU(),
+           nn.Dropout(args.dropout)
+       )
+       self.backbone.apply(orthogonal_init)
+
+
+       self.router = nn.Linear(hidden_dim, num_experts)
+       orthogonal_init(self.router, gain=0.01)
+
+
+       self.experts_mean = nn.ModuleList([
+           nn.Linear(hidden_dim, action_dim) for _ in range(num_experts)
+       ])
+       self.experts_logstd = nn.ModuleList([
+           nn.Linear(hidden_dim, action_dim) for _ in range(num_experts)
+       ])
+
+
+       for exp in self.experts_mean:
+           orthogonal_init(exp, gain=0.01)
+       for exp in self.experts_logstd:
+           orthogonal_init(exp, gain=0.01)
+
+
+       self.log_std_min = -5.0
+       self.log_std_max = 2.0
+
+
+   def forward(self, state, temperature=1.0, hard=False, eval_mode=False):
+       features = self.backbone(state)
+
+
+       router_logits = self.router(features)
+
+
+       if eval_mode:
+           gate_indices = torch.argmax(router_logits, dim=-1)
+           gate_mask = F.one_hot(gate_indices, num_classes=self.num_experts).float()
+           gate_probs = F.softmax(router_logits, dim=-1)
+       else:
+           gate_mask = F.gumbel_softmax(router_logits, tau=temperature, hard=hard)
+           gate_probs = F.softmax(router_logits, dim=-1)
+
+
+       raw_means = torch.stack([exp(features) for exp in self.experts_mean], dim=1)
+       post_tanh_means = torch.tanh(raw_means)
+
+
+       log_stds = torch.stack([exp(features) for exp in self.experts_logstd], dim=1)
+       log_stds = torch.clamp(log_stds, self.log_std_min, self.log_std_max)
+       stds = torch.exp(log_stds)
+
+
+       final_mean = torch.einsum('bk,bka->ba', gate_mask, post_tanh_means)
+       final_std = torch.einsum('bk,bka->ba', gate_mask, stds)
+
+
+       return final_mean, final_std, gate_probs, post_tanh_means, stds, raw_means
+
+
+   def get_action(self, state):
+       with torch.no_grad():
+           state = torch.FloatTensor(state).to(args.device).unsqueeze(0)
+           mean, _, _, _, _, _ = self(state, eval_mode=True)
+           action = mean.cpu().numpy()[0]
+       return np.clip(action, -1.0, 1.0)
+
+
+
+
+# ==============================================================================
+# 4. 价值网络
+# ==============================================================================
+class ValueFunction(nn.Module):
+   def __init__(self, state_dim, hidden_dim):
+       super().__init__()
+       self.net = MLP(state_dim, 1, hidden_dim, 2, layer_norm=True)
+
+
+   def forward(self, state):
+       return self.net(state)
+
+
+
+
+class TwinQ(nn.Module):
+   def __init__(self, state_dim, action_dim, hidden_dim):
+       super().__init__()
+       self.q1 = MLP(state_dim + action_dim, 1, hidden_dim, 2, layer_norm=True)
+       self.q2 = MLP(state_dim + action_dim, 1, hidden_dim, 2, layer_norm=True)
+
+
+   def forward(self, state, action):
+       sa = torch.cat([state, action], dim=1)
+       return self.q1(sa), self.q2(sa)
+
+
+
+
+# ==============================================================================
+# 5. Squashed Gaussian 混合似然 (带 Jacobian 修正)
+# ==============================================================================
+def compute_squashed_mixture_log_prob(actions, raw_means, stds, gate_probs):
+   """
+   正确的 Squashed Gaussian 混合似然
+
+
+   数学：
+   u ~ N(μ, σ²), a = tanh(u)
+   p(a) = p(u) * |du/da| = N(u; μ, σ²) / (1 - a²)
+   log p(a) = log N(atanh(a); μ, σ²) - log(1 - a²)
+   """
+   B, K, A = raw_means.shape
+   EPS = 1e-6
+
+
+   # 反变换到 pre-tanh 空间
+   actions_clamped = torch.clamp(actions, -1.0 + EPS, 1.0 - EPS)
+   u = torch.atanh(actions_clamped)
+   u_expanded = u.unsqueeze(1).expand(B, K, A)
+
+
+   # Pre-tanh 高斯对数概率
+   var = stds.pow(2)
+   log_prob_u = -0.5 * (
+           (u_expanded - raw_means).pow(2) / var +
+           torch.log(var) +
+           np.log(2 * np.pi)
+   )
+   log_prob_u = log_prob_u.sum(dim=-1)
+
+
+   # Jacobian 修正
+   log_jacobian = -torch.log(1.0 - actions_clamped.pow(2) + EPS).sum(dim=-1)
+   log_jacobian = log_jacobian.unsqueeze(1)
+
+
+   # 混合似然
+   log_gate = torch.log(gate_probs + EPS)
+   log_component_prob = log_prob_u + log_jacobian
+   weighted_log_probs = log_gate + log_component_prob
+   mixture_log_prob = torch.logsumexp(weighted_log_probs, dim=1, keepdim=True)
+
+
+   return mixture_log_prob
+
+
+
+
+# ==============================================================================
+# 6. Pre-tanh 空间 DPP 损失
+# ==============================================================================
+def compute_dpp_loss_pretanh(raw_means, expert_weights, kernel_scale, epsilon):
+   """
+   在 Pre-tanh 空间计算 DPP，避免边界距离失真
+   """
+   B, K, A = raw_means.shape
+
+
+   # Pre-tanh 距离
+   diff = raw_means.unsqueeze(2) - raw_means.unsqueeze(1)
+   dist_sq = torch.sum(diff.pow(2), dim=-1)
+
+
+   # 调整后的 kernel scale
+   adjusted_scale = kernel_scale * args.dpp_kernel_scale_pretanh_multiplier
+   kernel_mat = torch.exp(-dist_sq / (2 * adjusted_scale ** 2))
+
+
+   # Q-Masking
+   weight_matrix = expert_weights.unsqueeze(2) * expert_weights.unsqueeze(1)
+   weighted_kernel = kernel_mat * weight_matrix
+
+
+   # Identity Shielding
+   m_sq = expert_weights.pow(2)
+   padding_diag = 1.0 - m_sq + epsilon
+   padding_mat = torch.diag_embed(padding_diag)
+   L_robust = weighted_kernel + padding_mat
+
+
+   # Log determinant
+   try:
+       L_chol = torch.linalg.cholesky(L_robust)
+       log_det = 2.0 * torch.sum(
+           torch.log(torch.diagonal(L_chol, dim1=-2, dim2=-1) + 1e-10),
+           dim=-1
+       )
+       dpp_loss = -log_det.mean()
+   except RuntimeError:
+       dpp_loss = torch.tensor(0.0, device=raw_means.device)
+
+
+   return dpp_loss
+
+
+
+
+# ==============================================================================
+# 7. DEPO Agent
+# ==============================================================================
+class DEPOAgent:
+   def __init__(self, state_dim, action_dim):
+       self.state_dim = state_dim
+       self.action_dim = action_dim
+
+
+       self.policy = DepoPolicy(
+           state_dim, action_dim, args.hidden_dim, args.num_experts
+       ).to(args.device)
+
+
+       self.q_net = TwinQ(state_dim, action_dim, args.hidden_dim).to(args.device)
+       self.q_target = TwinQ(state_dim, action_dim, args.hidden_dim).to(args.device)
+       self.q_target.load_state_dict(self.q_net.state_dict())
+       self.v_net = ValueFunction(state_dim, args.hidden_dim).to(args.device)
+
+
+       self.policy_optimizer = optim.AdamW(
+           self.policy.parameters(), lr=args.lr, weight_decay=args.weight_decay
+       )
+       self.q_optimizer = optim.Adam(self.q_net.parameters(), lr=args.qf_lr)
+       self.v_optimizer = optim.Adam(self.v_net.parameters(), lr=args.vf_lr)
+
+
+       self.policy_lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+           self.policy_optimizer, T_max=args.max_steps, eta_min=args.lr_end
+       )
+
+
+       self.ema_quality_dist = torch.ones(args.num_experts).to(args.device) / args.num_experts
+
+
+   def get_current_temperature(self, step):
+       p = min(1.0, step / args.max_steps)
+       return args.temp_start + p * (args.temp_end - args.temp_start)
+
+
+   def update_v(self, states, actions):
+       with torch.no_grad():
+           q1, q2 = self.q_target(states, actions)
+           q_target = torch.min(q1, q2)
+
+
+       v_pred = self.v_net(states)
+       diff = q_target - v_pred
+       weight = torch.where(diff > 0, args.tau, 1 - args.tau)
+       v_loss = torch.mean(weight * (diff ** 2))
+
+
+       self.v_optimizer.zero_grad()
+       v_loss.backward()
+       torch.nn.utils.clip_grad_norm_(self.v_net.parameters(), args.max_grad_norm)
+       self.v_optimizer.step()
+       return v_loss.item()
+
+
+   def update_q(self, states, actions, rewards, next_states, terminals):
+       with torch.no_grad():
+           next_v = self.v_net(next_states)
+           q_target = rewards + args.discount * (1. - terminals) * next_v
+
+
+       q1, q2 = self.q_net(states, actions)
+       q_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+
+
+       self.q_optimizer.zero_grad()
+       q_loss.backward()
+       torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), args.max_grad_norm)
+       self.q_optimizer.step()
+
+
+       for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
+           target_param.data.copy_(
+               args.iql_tau * param.data + (1 - args.iql_tau) * target_param.data
+           )
+
+
+       return q_loss.item()
+
+
+   def update_policy(self, states, actions, step):
+       # 1. Advantage
+       with torch.no_grad():
+           q1, q2 = self.q_target(states, actions)
+           q_val = torch.min(q1, q2)
+           v_val = self.v_net(states)
+           adv = q_val - v_val
+
+
+           # [Stats] Q & V & Adv statistics
+           q_mean, q_min, q_max = q_val.mean().item(), q_val.min().item(), q_val.max().item()
+           v_mean, v_std = v_val.mean().item(), v_val.std().item()
+           adv_mean, adv_std, adv_max = adv.mean().item(), adv.std().item(), adv.max().item()
+
+
+
+
+           # [关键] AntMaze 的 advantage 范围约 [-1, 0]
+           # beta=10 使得权重在合理范围
+           exp_adv = torch.exp(adv * args.beta)
+           exp_adv = torch.clamp(exp_adv, max=100.0)
+
+
+           # [Stats] AWR Weights
+           awr_mean, awr_max = exp_adv.mean().item(), exp_adv.max().item()
+
+
+       # 2. Forward
+       current_temp = self.get_current_temperature(step)
+       _, _, gate_probs, post_tanh_means, stds, raw_means = self.policy(
+           states, temperature=current_temp, hard=False
+       )
+       # [Stats] Gate Entropy & Usage
+       entropy = -torch.sum(gate_probs * torch.log(gate_probs + 1e-6), dim=-1).mean().item()
+       expert_usage = gate_probs.mean(dim=0).detach().cpu().numpy()
+
+
+       # 3. 混合似然损失
+       mixture_log_prob = compute_squashed_mixture_log_prob(
+           actions, raw_means, stds, gate_probs
+       )
+       policy_loss = -(exp_adv * mixture_log_prob).mean()
+
+
+       # [Stats] Log Prob
+       log_prob_mean = mixture_log_prob.mean().item()
+
+
+       # 4. DPP 损失
+       B, K, A_dim = raw_means.shape
+       states_expanded = states.unsqueeze(1).expand(B, K, self.state_dim).reshape(B * K, self.state_dim)
+       expert_actions_flat = post_tanh_means.detach().reshape(B * K, A_dim)
+
+
+       with torch.no_grad():
+           q_e1, q_e2 = self.q_target(states_expanded, expert_actions_flat)
+           q_expert_vals = torch.min(q_e1, q_e2).reshape(B, K)
+           expert_adv = q_expert_vals - v_val
+           expert_weights = torch.sigmoid(expert_adv * args.dpp_margin_beta)
+
+
+           # [Stats] Expert Quality (Mean Sigmoid Weight per expert)
+           expert_quality = expert_weights.mean(dim=0).detach().cpu().numpy()
+
+
+       dpp_loss = compute_dpp_loss_pretanh(
+           raw_means, expert_weights, args.dpp_kernel_scale, args.dpp_epsilon
+       )
+
+
+       # 5. Pre-Tanh 正则化
+       raw_means_abs = raw_means.abs()
+       excess = F.relu(raw_means_abs - args.tanh_reg_threshold)
+       reg_loss = args.lambda_tanh_reg * (excess ** 2).mean()
+
+
+       # 6. 负载均衡
+       avg_router_usage = gate_probs.mean(dim=0)
+       with torch.no_grad():
+           avg_expert_quality = expert_weights.mean(dim=0)
+           alpha_smooth = 1e-2
+           numerator = avg_expert_quality + alpha_smooth
+           denominator = avg_expert_quality.sum() + args.num_experts * alpha_smooth
+           current_target_usage = numerator / denominator
+           self.ema_quality_dist = (
+                   (1 - args.load_ema_alpha) * self.ema_quality_dist +
+                   args.load_ema_alpha * current_target_usage
+           )
+       load_loss = F.mse_loss(avg_router_usage, self.ema_quality_dist)
+
+
+       # 7. 总损失
+       total_loss = (
+               policy_loss +
+               args.lambda_dpp * dpp_loss +
+               args.lambda_load * load_loss +
+               reg_loss
+       )
+
+
+       self.policy_optimizer.zero_grad()
+       total_loss.backward()
+       torch.nn.utils.clip_grad_norm_(self.policy.parameters(), args.max_grad_norm)
+       self.policy_optimizer.step()
+       self.policy_lr_scheduler.step()
+       # Pack metrics for logging
+       log_metrics = {
+           "q_range": (q_min, q_max),
+           "q_mean": q_mean,
+           "v_stats": (v_mean, v_std),
+           "adv_stats": (adv_mean, adv_std, adv_max),
+           "awr_stats": (awr_mean, awr_max),
+           "gate_entropy": entropy,
+           "expert_usage": expert_usage,
+           "expert_quality": expert_quality,
+           "log_prob": log_prob_mean
+       }
+
+
+       return policy_loss.item(), dpp_loss.item(), load_loss.item(), reg_loss.item(), current_temp,log_metrics
+
+
+
+
+# ==============================================================================
+# 8. 数据处理
+# ==============================================================================
+def get_dataset(env):
+    dataset = d4rl.qlearning_dataset(env)
+
+    # --- [关键修复] ---
+    # 确保 'terminals' 不包含 'timeouts'。
+    # 如果 timeout=True，则 terminal 必须强制设为 False，以便进行 bootstrap (V(s') 继续传播)。
+    if 'timeouts' in dataset:
+        # 使用布尔索引：凡是 timeouts 为 True 的地方，terminals 设为 False
+        dataset['terminals'] = dataset['terminals'] & ~dataset['timeouts']
+        print("Explicitly removed timeouts from terminals to enable bootstrapping.")
+
+    # AntMaze 奖励处理：r - 1
+    if "antmaze" in args.env_name:
+        print(f"AntMaze Reward Transform: r -> (r + {args.reward_bias}) * {args.reward_scale}")
+        dataset['rewards'] = (dataset['rewards'] + args.reward_bias) * args.reward_scale
+
+    return dataset
+
+
+def eval_policy(agent, env_name, seed, state_mean, state_std, eval_episodes=100):
+   eval_env = gym.make(env_name)
+   eval_env.seed(seed + 100)
+
+
+   total_normalized_score = 0.
+   successes = 0
+
+
+   for ep in range(eval_episodes):
+       state, done = eval_env.reset(), False
+       episode_reward = 0
+       while not done:
+           state_norm = (state - state_mean) / state_std
+           action = agent.policy.get_action(state_norm)
+           state, reward, done, info = eval_env.step(action)
+           episode_reward += reward
+
+
+       # AntMaze 成功条件
+       if episode_reward > 0:
+           successes += 1
+       total_normalized_score += eval_env.get_normalized_score(episode_reward)
+
+
+   avg_score = (total_normalized_score / eval_episodes) * 100
+   success_rate = successes / eval_episodes * 100
+
+
+   return avg_score, success_rate
+
+
+
+
+# ==============================================================================
+# 9. 主函数
+# ==============================================================================
+def main():
+   set_seed(args.seed)
+
+
+   env = gym.make(args.env_name)
+   state_dim = env.observation_space.shape[0]
+   action_dim = env.action_space.shape[0]
+
+
+   # 动态设置 kernel scale
+   args.dpp_kernel_scale = np.sqrt(action_dim) / 1.5
+
+
+   print("=" * 70)
+   print(f"DEPO-AntMaze Training: {args.env_name}")
+   print("=" * 70)
+   print(f"State dim: {state_dim}, Action dim: {action_dim}")
+   print(f"Num experts: {args.num_experts}, Hidden dim: {args.hidden_dim}")
+   print("-" * 70)
+   print("AntMaze-specific settings:")
+   print(f"  Reward transform: r -> (r + {args.reward_bias}) * {args.reward_scale}")
+   print(f"  Beta (AWR temp): {args.beta}")
+   print(f"  Tau (expectile): {args.tau}")
+   print(f"  Discount: {args.discount}")
+   print(f"  DPP lambda: {args.lambda_dpp}")
+   print("=" * 70)
+
+
+   # 数据处理
+   data_dict = get_dataset(env)
+
+
+   state_mean, state_std = compute_mean_std(data_dict['observations'], eps=1e-3)
+   data_dict['observations'] = normalize_states(data_dict['observations'], state_mean, state_std)
+   data_dict['next_observations'] = normalize_states(data_dict['next_observations'], state_mean, state_std)
+
+
+   dataset = dict(
+       states=torch.from_numpy(data_dict['observations']).float(),
+       actions=torch.from_numpy(data_dict['actions']).float(),
+       rewards=torch.from_numpy(data_dict['rewards']).float().unsqueeze(-1),
+       next_states=torch.from_numpy(data_dict['next_observations']).float(),
+       terminals=torch.from_numpy(data_dict['terminals']).float().unsqueeze(-1)
+   )
+
+
+   N = dataset['states'].shape[0]
+   print(f"Dataset size: {N}")
+
+
+   agent = DEPOAgent(state_dim, action_dim)
+
+
+   best_score = 0
+
+
+   # 辅助函数：将数组格式化为 [0.25, 0.50, ...] 的字符串
+   def fmt_arr(arr):
+       return "[" + ", ".join([f"{x:.2f}" for x in arr]) + "]"
+
+
+   print("Start Training...")
+
+
+   for step in range(args.max_steps):
+       # 1. 数据采样
+       idx = np.random.randint(0, N, args.batch_size)
+       states = dataset['states'][idx].to(args.device)
+       actions = dataset['actions'][idx].to(args.device)
+       rewards = dataset['rewards'][idx].to(args.device)
+       next_states = dataset['next_states'][idx].to(args.device)
+       terminals = dataset['terminals'][idx].to(args.device)
+
+
+       # 2. 更新 V 和 Q
+       v_loss = agent.update_v(states, actions)
+       q_loss = agent.update_q(states, actions, rewards, next_states, terminals)
+
+
+       # 3. 更新 Policy
+       # [注意] 这里增加了 metrics 返回值的接收
+       pi_loss, dpp_loss, load_loss, reg_loss, temp, metrics = agent.update_policy(states, actions, step)
+
+
+       # 4. 定期打印日志 (例如每 5000 步)
+       if (step + 1) % 5000 == 0:
+           # 从 metrics 字典中解包数据，使代码更整洁
+           q_min, q_max = metrics['q_range']
+           v_mean, v_std = metrics['v_stats']
+           adv_mean, adv_std, adv_max = metrics['adv_stats']
+           awr_mean, awr_max = metrics['awr_stats']
+
+
+           # 按照你要求的格式打印
+           print(f"\n[Step {step + 1}]")
+           print(f"  Loss: V={v_loss:.4f}, Q={q_loss:.4f}, Pi={pi_loss:.4f}, DPP={dpp_loss:.4f}")
+           print(f"  Q_target: [{q_min:.2f}, {q_max:.2f}], mean={metrics['q_mean']:.2f}")
+           print(f"  V: mean={v_mean:.2f}, std={v_std:.2f}")
+           print(f"  Adv: mean={adv_mean:.2f}, std={adv_std:.2f}, max={adv_max:.2f}")
+           print(f"  AWR weight: mean={awr_mean:.2f}, max={awr_max:.1f}")
+           print(f"  Gate entropy={metrics['gate_entropy']:.2f}, Temp={temp:.2f}")
+
+
+           # 使用 fmt_arr 格式化列表
+           print(f"  Expert usage: {fmt_arr(metrics['expert_usage'])}")
+           print(f"  Expert quality: {fmt_arr(metrics['expert_quality'])}")
+           print(f"  Log prob: {metrics['log_prob']:.2f}")
+
+
+       # 5. 评估 (保持原有逻辑)
+       if (step + 1) % args.eval_freq == 0:
+           score, success_rate = eval_policy(
+               agent, args.env_name, args.seed, state_mean, state_std, args.eval_episodes
+           )
+           if score > best_score:
+               best_score = score
+           print(f">>> Eval @ {step + 1}: Score={score:.2f}, Success={success_rate:.1f}%, Best={best_score:.2f}")
+
+
+
+
+if __name__ == "__main__":
+   main()
+
+
